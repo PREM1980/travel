@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${TRAVEL_POSTGRES_USER:-travel}
+      POSTGRES_PASSWORD: ${TRAVEL_POSTGRES_PASSWORD:-travel}
+      POSTGRES_DB: ${TRAVEL_POSTGRES_DB:-travel}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  api:
+    build: { context: ., dockerfile: Dockerfile.api }
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${TRAVEL_POSTGRES_USER:-travel}:${TRAVEL_POSTGRES_PASSWORD:-travel}@postgres:5432/${TRAVEL_POSTGRES_DB:-travel}
+      TRAVEL_CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+    depends_on: { postgres: { condition: service_healthy } }
+    ports: ["8000:8000"]
+  ui:
+    build: ./ui
+    depends_on: [api]
+    ports: ["8080:80"]
+volumes:
+  postgres-data:
