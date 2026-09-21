@@ -117,6 +117,8 @@ CREATE TABLE IF NOT EXISTS trip_destinations (
   id UUID PRIMARY KEY, trip_id UUID NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
   country TEXT NOT NULL, city TEXT NOT NULL, position INTEGER NOT NULL
 );
+ALTER TABLE trip_destinations ADD COLUMN IF NOT EXISTS start_date DATE;
+ALTER TABLE trip_destinations ADD COLUMN IF NOT EXISTS end_date DATE;
 CREATE TABLE IF NOT EXISTS itinerary_days (
   id UUID PRIMARY KEY, trip_id UUID NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
   day_number INTEGER NOT NULL, date DATE, UNIQUE(trip_id, day_number)
@@ -195,7 +197,16 @@ class Credentials(BaseModel):
     display_name: str = Field(default="Traveler", min_length=1, max_length=100)
 
 
-class Destination(BaseModel): country: str; city: str
+class Destination(BaseModel):
+    country: str
+    city: str
+    start_date: str | None = None
+    end_date: str | None = None
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def serialize_database_dates(cls, value: str | date | None) -> str | None:
+        return value.isoformat() if isinstance(value, date) else value
 class ItineraryItem(BaseModel):
     day_number: int = Field(ge=1); kind: Literal["visit", "transport", "meal", "stay"] = "visit"; title: str = Field(min_length=1, max_length=200)
     start_time: str | None = None; end_time: str | None = None; duration_minutes: int | None = Field(default=None, ge=0); estimated_cost: float | None = Field(default=None, ge=0); notes: str = ""
@@ -809,6 +820,44 @@ def orchestrate_itinerary(
     return itinerary, validate_itinerary_with_agent(data, itinerary, confirmed_segments)
 
 
+def destination_date_issue(destinations: list[Destination]) -> str | None:
+    """Return a human-readable problem with the destinations' date ranges, or None
+    if every dated destination is in order and non-overlapping. A destination
+    without dates yet is skipped rather than flagged here — that is caught by the
+    separate "every destination needs a country and city" check."""
+    for destination in destinations:
+        if destination.start_date and destination.end_date and destination.start_date > destination.end_date:
+            return f"{destination.city or 'A destination'}'s start date is after its end date."
+    dated = [d for d in destinations if d.start_date and d.end_date]
+    for previous, current in zip(dated, dated[1:]):
+        if current.start_date < previous.end_date:
+            return f"{current.city or 'A destination'} starts before {previous.city or 'the previous destination'} ends."
+    return None
+
+
+def destination_for_day(data: TripWrite, day_number: int) -> Destination | None:
+    """Return which destination day_number falls under, or None for a free/gap day.
+    A day shared by two destinations' ranges (a same-day transition) resolves to
+    the destination that starts on that day."""
+    if not data.start_date:
+        return None
+    try:
+        day_date = date.fromisoformat(data.start_date) + timedelta(days=day_number - 1)
+    except ValueError:
+        return None
+    day_iso = day_date.isoformat()
+    candidates = [
+        d for d in data.destinations
+        if d.start_date and d.end_date and d.start_date <= day_iso <= d.end_date
+    ]
+    if not candidates:
+        return None
+    for destination in candidates:
+        if destination.start_date == day_iso:
+            return destination
+    return candidates[0]
+
+
 def generate_validated_itinerary(
     data: TripWrite,
     document_context: str = "",
@@ -820,6 +869,9 @@ def generate_validated_itinerary(
         raise HTTPException(422, "Trip name and a valid date range are required")
     if not data.destinations or any(not item.country.strip() or not item.city.strip() for item in data.destinations):
         raise HTTPException(422, "At least one country and city destination is required")
+    destination_issue = destination_date_issue(data.destinations)
+    if destination_issue:
+        raise HTTPException(422, destination_issue)
     try:
         top_places_payload = parse_agent_json(
             generate_itinerary(_top_places_prompt(data, document_context), document_workspace, document_files)
@@ -1021,7 +1073,7 @@ def trip_detail(trip_id: str, user_id: str) -> dict:
     with db().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT * FROM trips WHERE id=%s AND user_id=%s", (trip_id, user_id)); trip = cur.fetchone()
         if not trip: raise HTTPException(404, "Trip not found")
-        cur.execute("SELECT country,city,position FROM trip_destinations WHERE trip_id=%s ORDER BY position", (trip_id,)); trip["destinations"] = cur.fetchall()
+        cur.execute("SELECT country,city,start_date,end_date,position FROM trip_destinations WHERE trip_id=%s ORDER BY position", (trip_id,)); trip["destinations"] = cur.fetchall()
         cur.execute("SELECT d.day_number,d.date,i.kind,i.title,i.start_time,i.end_time,i.duration_minutes,i.estimated_cost,i.notes,i.position FROM itinerary_days d LEFT JOIN itinerary_items i ON i.day_id=d.id WHERE d.trip_id=%s ORDER BY d.day_number,i.position", (trip_id,)); trip["itinerary"] = cur.fetchall()
         cur.execute("SELECT id,filename,content_type,byte_size,created_at FROM trip_documents WHERE trip_id=%s ORDER BY created_at DESC", (trip_id,)); trip["documents"] = cur.fetchall()
     plans = trip.get("plans") or []
@@ -1044,7 +1096,7 @@ def save_trip(data: TripWrite, user_id: str, trip_id: str | None = None) -> dict
         if trip_id:
             conn.execute("INSERT INTO trips (id,user_id,name,start_date,end_date,adults,children,trip_type,preferences,plan_generated,plans,active_plan_index,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,start_date=EXCLUDED.start_date,end_date=EXCLUDED.end_date,adults=EXCLUDED.adults,children=EXCLUDED.children,trip_type=EXCLUDED.trip_type,preferences=EXCLUDED.preferences,plan_generated=EXCLUDED.plan_generated,plans=EXCLUDED.plans,active_plan_index=EXCLUDED.active_plan_index,updated_at=EXCLUDED.updated_at WHERE trips.user_id=EXCLUDED.user_id", (trip_id,user_id,data.name,data.start_date,data.end_date,data.adults,data.children,data.trip_type,json.dumps(data.preferences),data.plan_generated or bool(plans),json.dumps([plan.model_dump() for plan in plans]),active_plan_index,timestamp,timestamp))
         conn.execute("DELETE FROM trip_destinations WHERE trip_id=%s", (trip_id,)); conn.execute("DELETE FROM itinerary_days WHERE trip_id=%s", (trip_id,))
-        for position, destination in enumerate(data.destinations): conn.execute("INSERT INTO trip_destinations (id,trip_id,country,city,position) VALUES (%s,%s,%s,%s,%s)", (str(uuid.uuid4()),trip_id,destination.country,destination.city,position))
+        for position, destination in enumerate(data.destinations): conn.execute("INSERT INTO trip_destinations (id,trip_id,country,city,start_date,end_date,position) VALUES (%s,%s,%s,%s,%s,%s,%s)", (str(uuid.uuid4()),trip_id,destination.country,destination.city,destination.start_date,destination.end_date,position))
         days: dict[int, str] = {}
         for position, item in enumerate(active_itinerary):
             day_id = days.setdefault(item.day_number, str(uuid.uuid4()))

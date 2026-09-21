@@ -1,7 +1,7 @@
 import inspect
 from datetime import date
 
-from travel_api.app import Destination, DocumentExtraction, TopPlace, TripWrite, _itinerary_prompt, _top_places_prompt, document_date_conflict, document_dates_are_within_trip_tolerance, extract_document_text, generate_itinerary_for_trip, has_exactly_twenty_distinct_top_places, has_minimum_generated_activities, is_top_place_visit, normalize_recommendation_payload, parse_agent_json, recalculate_trip_from_documents, should_recalculate_after_document_upload
+from travel_api.app import Destination, DocumentExtraction, TopPlace, TripWrite, _itinerary_prompt, _top_places_prompt, destination_date_issue, destination_for_day, document_date_conflict, document_dates_are_within_trip_tolerance, extract_document_text, generate_itinerary_for_trip, has_exactly_twenty_distinct_top_places, has_minimum_generated_activities, is_top_place_visit, normalize_recommendation_payload, parse_agent_json, recalculate_trip_from_documents, should_recalculate_after_document_upload
 
 
 def test_generated_itineraries_allow_detailed_transport_rows() -> None:
@@ -177,3 +177,74 @@ def test_top_places_must_be_exactly_twenty_and_unique() -> None:
     assert has_exactly_twenty_distinct_top_places(places)
     assert not has_exactly_twenty_distinct_top_places(places[:-1])
     assert not has_exactly_twenty_distinct_top_places([*places[:-1], places[0]])
+
+
+def test_destination_date_issue_flags_a_backwards_range() -> None:
+    issue = destination_date_issue([
+        Destination(country="France", city="Paris", start_date="2027-06-05", end_date="2027-06-01"),
+    ])
+    assert issue == "Paris's start date is after its end date."
+
+
+def test_destination_date_issue_allows_a_shared_transition_day() -> None:
+    issue = destination_date_issue([
+        Destination(country="France", city="Paris", start_date="2027-06-01", end_date="2027-06-05"),
+        Destination(country="Italy", city="Rome", start_date="2027-06-05", end_date="2027-06-09"),
+    ])
+    assert issue is None
+
+
+def test_destination_date_issue_allows_a_gap_between_destinations() -> None:
+    issue = destination_date_issue([
+        Destination(country="France", city="Paris", start_date="2027-06-01", end_date="2027-06-05"),
+        Destination(country="Italy", city="Rome", start_date="2027-06-08", end_date="2027-06-12"),
+    ])
+    assert issue is None
+
+
+def test_destination_date_issue_flags_a_genuine_overlap() -> None:
+    issue = destination_date_issue([
+        Destination(country="France", city="Paris", start_date="2027-06-01", end_date="2027-06-05"),
+        Destination(country="Italy", city="Rome", start_date="2027-06-04", end_date="2027-06-09"),
+    ])
+    assert issue == "Rome starts before Paris ends."
+
+
+def test_destination_date_issue_ignores_destinations_without_dates_yet() -> None:
+    issue = destination_date_issue([
+        Destination(country="France", city="Paris", start_date="2027-06-01", end_date="2027-06-05"),
+        Destination(country="Italy", city="Rome"),
+    ])
+    assert issue is None
+
+
+def test_destination_for_day_maps_a_single_city_trip() -> None:
+    trip = TripWrite(
+        name="Rome trip", start_date="2027-06-01", end_date="2027-06-05",
+        destinations=[Destination(country="Italy", city="Rome", start_date="2027-06-01", end_date="2027-06-05")],
+    )
+    destination = destination_for_day(trip, 3)
+    assert destination is not None and destination.city == "Rome"
+
+
+def test_destination_for_day_resolves_a_shared_transition_day_to_the_arriving_city() -> None:
+    trip = TripWrite(
+        name="Multi-city trip", start_date="2027-06-01", end_date="2027-06-09",
+        destinations=[
+            Destination(country="France", city="Paris", start_date="2027-06-01", end_date="2027-06-05"),
+            Destination(country="Italy", city="Rome", start_date="2027-06-05", end_date="2027-06-09"),
+        ],
+    )
+    destination = destination_for_day(trip, 5)
+    assert destination is not None and destination.city == "Rome"
+
+
+def test_destination_for_day_returns_none_for_a_gap_day() -> None:
+    trip = TripWrite(
+        name="Multi-city trip with a gap", start_date="2027-06-01", end_date="2027-06-12",
+        destinations=[
+            Destination(country="France", city="Paris", start_date="2027-06-01", end_date="2027-06-05"),
+            Destination(country="Italy", city="Rome", start_date="2027-06-08", end_date="2027-06-12"),
+        ],
+    )
+    assert destination_for_day(trip, 7) is None
