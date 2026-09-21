@@ -115,6 +115,16 @@ textarea.invalid:focus {
   outline: 2px solid #c0362c;
   border-color: #c0362c;
 }
+.field-error {
+  color: #c0362c;
+  font-size: 0.85rem;
+  margin: 0.4rem 0 0;
+}
+.field-hint {
+  color: #8a8377;
+  font-size: 0.8rem;
+  margin: -0.6rem 0 0;
+}
 .primary {
   background: #d07535;
   color: #fff;

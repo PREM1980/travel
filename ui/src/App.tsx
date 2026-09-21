@@ -1,7 +1,7 @@
 import { CSSProperties, FormEvent, MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from "react";
 
 type User = { id: string; email: string; display_name: string };
-type Destination = { country: string; city: string };
+type Destination = { country: string; city: string; start_date?: string; end_date?: string };
 type Item = {
   day_number: number;
   kind: "visit" | "transport" | "meal" | "stay";
@@ -93,6 +93,67 @@ const sameDestinations = (a: Destination[], b: Destination[]): boolean =>
       d.country.trim().toLowerCase() === b[i].country.trim().toLowerCase() &&
       d.city.trim().toLowerCase() === b[i].city.trim().toLowerCase(),
   );
+const dayNumberDate = (startDate: string, dayNumber: number): Date => {
+  const [year, month, day] = startDate.split("-").map(Number);
+  return new Date(year, month - 1, day + (dayNumber - 1));
+};
+const isoDate = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const daysBetween = (startIso: string, endIso: string): number => {
+  const [sy, sm, sd] = startIso.split("-").map(Number);
+  const [ey, em, ed] = endIso.split("-").map(Number);
+  const start = new Date(sy, sm - 1, sd);
+  const end = new Date(ey, em - 1, ed);
+  return Math.round((end.getTime() - start.getTime()) / 86400000) + 1;
+};
+const destinationForDay = (
+  startDate: string | undefined,
+  destinations: Destination[],
+  dayNumber: number,
+): Destination | null => {
+  if (!startDate) return null;
+  const dayIso = isoDate(dayNumberDate(startDate, dayNumber));
+  const dated = destinations.filter((d) => d.start_date && d.end_date);
+  if (!dated.length && destinations.length === 1) return destinations[0];
+  const candidates = dated.filter((d) => d.start_date! <= dayIso && dayIso <= d.end_date!);
+  if (!candidates.length) return null;
+  return candidates.find((d) => d.start_date === dayIso) ?? candidates[0];
+};
+const destinationDateIssue = (destinations: Destination[]): string | null => {
+  for (const destination of destinations) {
+    if (destination.start_date && destination.end_date && destination.start_date > destination.end_date) {
+      return `${destination.city || "A destination"}'s start date is after its end date.`;
+    }
+  }
+  const dated = destinations.filter((d) => d.start_date && d.end_date);
+  for (let i = 1; i < dated.length; i++) {
+    const previous = dated[i - 1];
+    const current = dated[i];
+    if (current.start_date! < previous.end_date!) {
+      return `${current.city || "A destination"} starts before ${previous.city || "the previous destination"} ends.`;
+    }
+  }
+  return null;
+};
+const backfillDestinationDates = (t: Trip): Trip => {
+  if (!t.start_date || !t.end_date) return t;
+  const needsBackfill = t.destinations.some((d) => !d.start_date || !d.end_date);
+  if (!needsBackfill) return t;
+  if (t.destinations.length === 1) {
+    return { ...t, destinations: [{ ...t.destinations[0], start_date: t.start_date, end_date: t.end_date }] };
+  }
+  const totalDays = daysBetween(t.start_date, t.end_date);
+  const perCity = Math.max(1, Math.floor(totalDays / t.destinations.length));
+  const destinations = t.destinations.map((d, index) => {
+    if (d.start_date && d.end_date) return d;
+    const isLast = index === t.destinations.length - 1;
+    const span = isLast ? totalDays - perCity * index : perCity;
+    const start = isoDate(dayNumberDate(t.start_date!, perCity * index + 1));
+    const end = isoDate(dayNumberDate(t.start_date!, perCity * index + span));
+    return { ...d, start_date: start, end_date: end };
+  });
+  return { ...t, destinations };
+};
 const linkifyRecommendation = (value: string) => {
   const url = value.match(/https?:\/\/[^\s,]+/i)?.[0];
   if (!url) return value;
@@ -135,7 +196,7 @@ const blank = (): Omit<Trip, "id" | "documents"> => ({
   adults: 2,
   children: 2,
   trip_type: "family",
-  destinations: [{ country: "", city: "" }],
+  destinations: [{ country: "", city: "", start_date: "2027-04-02", end_date: "2027-04-06" }],
   preferences: { food: true, transport: true, tips: true, passes: true },
   plan_generated: false,
   plans: [],
@@ -218,6 +279,15 @@ function App() {
     [view, setView] = useState<"planner" | "trips" | "essentials" | "settings">(() =>
       window.location.pathname === "/trips" ? "trips" : window.location.pathname === "/essentials" ? "essentials" : window.location.pathname === "/settings" ? "settings" : "planner",
     );
+  useEffect(() => {
+    const dated = trip.destinations.filter((d) => d.start_date && d.end_date);
+    if (!dated.length) return;
+    const derivedStart = dated.reduce((min, d) => (d.start_date! < min ? d.start_date! : min), dated[0].start_date!);
+    const derivedEnd = dated.reduce((max, d) => (d.end_date! > max ? d.end_date! : max), dated[0].end_date!);
+    if (derivedStart !== trip.start_date || derivedEnd !== trip.end_date) {
+      setTrip((t) => ({ ...t, start_date: derivedStart, end_date: derivedEnd }));
+    }
+  }, [trip.destinations]);
   const draggedItemRef = useRef<number | null>(null);
   const assistantRef = useRef<HTMLElement | null>(null);
   const startAssistantResize = (e: ReactMouseEvent<HTMLDivElement>) => {
@@ -334,7 +404,7 @@ function App() {
   };
   const chooseTrip = async (id: string) => {
     const found = await api<Trip>(`/trips/${id}`);
-    setTrip(found);
+    setTrip(backfillDestinationDates(found));
     setScheduleWarnings([]);
     setChatConfirmed({ dates: false, travelers: false });
     const chats = await api<{ id: string }[]>(`/trips/${id}/conversations`);
@@ -392,8 +462,16 @@ function App() {
       setError((x as Error).message);
     }
   };
-  const appendDestination = () =>
-    update("destinations", [...trip.destinations, { country: "", city: "" }]);
+  const appendDestination = () => {
+    const previous = trip.destinations[trip.destinations.length - 1];
+    let start_date = "";
+    let end_date = "";
+    if (previous?.end_date) {
+      start_date = isoDate(dayNumberDate(previous.end_date, 2));
+      end_date = isoDate(dayNumberDate(previous.end_date, 5));
+    }
+    update("destinations", [...trip.destinations, { country: "", city: "", start_date, end_date }]);
+  };
   const setDestination = (
     index: number,
     key: keyof Destination,
@@ -426,8 +504,13 @@ function App() {
     trip.trip_type &&
     trip.destinations.length &&
     trip.destinations.every(
-      (destination) => destination.country.trim() && destination.city.trim(),
-    ),
+      (destination) =>
+        destination.country.trim() &&
+        destination.city.trim() &&
+        destination.start_date &&
+        destination.end_date,
+    ) &&
+    !destinationDateIssue(trip.destinations),
   );
   const invalidDateRange = Boolean(
     trip.start_date && trip.end_date && trip.start_date > trip.end_date,
@@ -439,6 +522,8 @@ function App() {
     destination: (index: number) => ({
       country: showValidation && !trip.destinations[index].country.trim(),
       city: showValidation && !trip.destinations[index].city.trim(),
+      startDate: showValidation && !trip.destinations[index].start_date,
+      endDate: showValidation && !trip.destinations[index].end_date,
     }),
   };
   const missingFieldLabels = (
@@ -475,6 +560,12 @@ function App() {
       month: "short",
       day: "numeric",
     });
+  };
+  const dayDestinationLabel = (dayNumber: number): string => {
+    if (!trip.start_date) return "";
+    const destination = destinationForDay(trip.start_date, trip.destinations, dayNumber);
+    if (destination) return destination.city;
+    return trip.destinations.length > 1 ? "Free day" : "";
   };
   const itineraryDays = Array.from(
     trip.itinerary
@@ -1267,24 +1358,13 @@ function App() {
             </label>
             <label>
               From
-              <input
-                type="date"
-                value={trip.start_date || ""}
-                onChange={(e) => update("start_date", e.target.value)}
-                className={fieldInvalid.startDate ? "invalid" : ""}
-                aria-invalid={fieldInvalid.startDate}
-              />
+              <input type="date" value={trip.start_date || ""} disabled readOnly />
             </label>
             <label>
               To
-              <input
-                type="date"
-                value={trip.end_date || ""}
-                onChange={(e) => update("end_date", e.target.value)}
-                className={fieldInvalid.endDate ? "invalid" : ""}
-                aria-invalid={fieldInvalid.endDate}
-              />
+              <input type="date" value={trip.end_date || ""} disabled readOnly />
             </label>
+            <p className="field-hint wide">Set from your destinations below.</p>
             <label>
               Adults
               <input
@@ -1398,6 +1478,20 @@ function App() {
                   className={fieldInvalid.destination(i).city ? "invalid" : ""}
                   aria-invalid={fieldInvalid.destination(i).city}
                 />
+                <input
+                  type="date"
+                  value={d.start_date || ""}
+                  onChange={(e) => setDestination(i, "start_date", e.target.value)}
+                  className={fieldInvalid.destination(i).startDate ? "invalid" : ""}
+                  aria-invalid={fieldInvalid.destination(i).startDate}
+                />
+                <input
+                  type="date"
+                  value={d.end_date || ""}
+                  onChange={(e) => setDestination(i, "end_date", e.target.value)}
+                  className={fieldInvalid.destination(i).endDate ? "invalid" : ""}
+                  aria-invalid={fieldInvalid.destination(i).endDate}
+                />
                 {trip.destinations.length > 1 && (
                   <button
                     onClick={() =>
@@ -1412,6 +1506,9 @@ function App() {
                 )}
               </div>
             ))}
+            {showValidation && destinationDateIssue(trip.destinations) && (
+              <p className="field-error">{destinationDateIssue(trip.destinations)}</p>
+            )}
             <button className="add" onClick={appendDestination}>
               + Add destination
             </button>
@@ -1448,6 +1545,9 @@ function App() {
                 <div className="day-plan-header">
                   <h3>
                     Day {dayNumber}
+                    {dayDestinationLabel(dayNumber) && (
+                      <span className="day-date"> — {dayDestinationLabel(dayNumber)}</span>
+                    )}
                     {dayDateLabel(dayNumber) && (
                       <span className="day-date"> — {dayDateLabel(dayNumber)}</span>
                     )}
