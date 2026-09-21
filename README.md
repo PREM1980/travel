@@ -4,15 +4,51 @@ A private, conversation-driven travel planning application. Each account owns it
 
 ## Run locally
 
+**Prerequisites:** Docker and Docker Compose. (Node 18+ and Python 3.11+/[uv](https://docs.astral.sh/uv/) are only needed for the non-Docker development modes below.)
+
 ```sh
+git clone git@github.com:PREM1980/travel.git
+cd travel
 cp .env.example .env
 docker compose up --build
 ```
 
-Open http://localhost:8080. The API health endpoint is http://localhost:8000/health.
-Public platform, technology, and API-route metadata is available at http://localhost:8000/metadata (or through the UI proxy at http://localhost:8080/api/metadata).
+`.env` works as-is for a first run: a local Postgres container starts automatically. To generate real itineraries, also set an LLM provider's credentials in `.env` — see [LLM providers](#llm-providers) below; without them, itinerary generation and chat will fail with a clear "not configured" error, but everything else (accounts, the trip form, document uploads) still works.
 
-For UI-only development, run `npm install && npm run dev` in `ui/`; Vite proxies `/api` to port 8000.
+Once it's running:
+
+1. Open http://localhost:8080 and register a new account (there's no seed/demo user).
+2. Fill in a trip, or describe it in the "Travel Concierge" chat panel.
+3. Click **Generate a random plan**.
+
+Other useful endpoints: the API health check is http://localhost:8000/health, and public platform/technology/API-route metadata is at http://localhost:8000/metadata (or through the UI proxy at http://localhost:8080/api/metadata).
+
+**After changing code**, rebuild just the service you touched and recreate it, rather than re-running the full `up --build`:
+
+```sh
+docker compose build api   # or: ui
+docker compose up -d api   # or: ui
+```
+
+**To stop:** `docker compose down` (add `-v` to also drop the Postgres volume and start from an empty database next time).
+
+### UI-only development
+
+```sh
+cd ui
+npm install
+npm run dev
+```
+
+Vite proxies `/api` to port 8000, so the backend (via Docker or directly) still needs to be running separately.
+
+### Backend-only development
+
+```sh
+docker compose up -d postgres   # or point DATABASE_URL at your own Postgres
+uv sync --group dev
+uv run uvicorn travel_api.app:app --reload --port 8000
+```
 
 ## Architecture
 
