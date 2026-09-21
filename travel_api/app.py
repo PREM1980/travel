@@ -461,7 +461,9 @@ def day_label(data: TripWrite, day_number: int) -> str:
         day_date = date.fromisoformat(data.start_date) + timedelta(days=day_number - 1)
     except ValueError:
         return f"Day {day_number}"
-    return f"Day {day_number} — {day_date.strftime('%a, %b %-d')}"
+    destination = destination_for_day(data, day_number)
+    place = destination.city if destination else "Free day"
+    return f"Day {day_number} — {place} — {day_date.strftime('%a, %b %-d')}"
 
 
 def build_plan_pdf(data: TripWrite, plan: ItineraryPlan) -> bytes:
@@ -580,39 +582,75 @@ Confirmed transport reservations extracted from the traveler's uploaded document
 """
 
 
-def _top_places_prompt(data: TripWrite, document_context: str = "") -> str:
-    destinations = ", ".join(f"{item.city}, {item.country}" for item in data.destinations)
-    return f"""You are an expert travel planner. Select the best places to visit for this trip.
+def destination_days(destination: Destination) -> int:
+    if not destination.start_date or not destination.end_date:
+        return 1
+    try:
+        return (date.fromisoformat(destination.end_date) - date.fromisoformat(destination.start_date)).days + 1
+    except ValueError:
+        return 1
+
+
+def top_place_count_for_destination(destination: Destination, destinations: list[Destination]) -> int:
+    total_days = sum(destination_days(d) for d in destinations) or 1
+    share = destination_days(destination) / total_days
+    return min(20, max(6, round(20 * share)))
+
+
+def _top_places_prompt(data: TripWrite, destination: Destination, place_count: int, document_context: str = "") -> str:
+    return f"""You are an expert travel planner. Select the best places to visit for this destination.
 Trip name: {data.name}
-Destinations (in order): {destinations}
-Dates: {data.start_date} to {data.end_date}
+Destination: {destination.city}, {destination.country}
+Dates at this destination: {destination.start_date} to {destination.end_date}
 Travelers: {data.adults} adults and {data.children} children
 Trip type: {data.trip_type}
 {document_reference_section(document_context)}
-Return only JSON in this exact shape: {{"places":[{{"name":"place name","reason":"short reason","recommended_duration_minutes":90}}]}}. Return exactly 20 distinct places. recommended_duration_minutes must be a realistic whole-number visit duration from 15 to 480 minutes. Do not invent opening hours, reservations, or prices."""
+Return only JSON in this exact shape: {{"places":[{{"name":"place name","reason":"short reason","recommended_duration_minutes":90}}]}}. Return exactly {place_count} distinct places. recommended_duration_minutes must be a realistic whole-number visit duration from 15 to 480 minutes. Do not invent opening hours, reservations, or prices."""
+
+
+def day_destination_lines(data: TripWrite) -> str:
+    if not data.start_date or not data.end_date:
+        return ""
+    try:
+        total_days = (date.fromisoformat(data.end_date) - date.fromisoformat(data.start_date)).days + 1
+    except ValueError:
+        return ""
+    lines = []
+    for day_number in range(1, total_days + 1):
+        destination = destination_for_day(data, day_number)
+        place = f"{destination.city}, {destination.country}" if destination else "no destination (free day)"
+        lines.append(f"Day {day_number}: {place}")
+    return "\n".join(lines)
 
 
 def _itinerary_prompt(
     data: TripWrite,
-    top_places: list[TopPlace],
+    top_places_by_destination: dict[str, list[TopPlace]],
     document_context: str = "",
     confirmed_segments: str = "",
 ) -> str:
     destinations = ", ".join(f"{item.city}, {item.country}" for item in data.destinations)
-    supplied_places = json.dumps([place.model_dump() for place in top_places], separators=(",", ":"))
+    supplied_places = json.dumps(
+        {key: [place.model_dump() for place in places] for key, places in top_places_by_destination.items()},
+        separators=(",", ":"),
+    )
     return f"""You are an expert travel planner. Create a varied, realistic itinerary for this trip.
 Trip name: {data.name}
 Destinations (in order): {destinations}
 Dates: {data.start_date} to {data.end_date}
 Travelers: {data.adults} adults and {data.children} children
 Trip type: {data.trip_type}
-Top places selected in the first planning pass: {supplied_places}
+Day-to-destination mapping:
+{day_destination_lines(data)}
+Top places selected in the first planning pass, grouped by destination: {supplied_places}
 {document_reference_section(document_context)}
 {confirmed_segments_section(confirmed_segments)}
-Every kind="visit" itinerary item must use one supplied place name, exactly as provided. Use as many supplied places as realistically fit within the trip dates and daily time limits; do not force all 20 into the itinerary. Use its recommended_duration_minutes unless a short trip day makes a reasonable adjustment necessary. Do not create other sightseeing visits.
+Every kind="visit" itinerary item must use one supplied place name, exactly as provided, and must be drawn from that day's own destination's list in the day-to-destination mapping above — never schedule a visit belonging to a different destination on that day. Use as many supplied places as realistically fit within the trip dates and daily time limits; do not force every supplied place into the itinerary. Use its recommended_duration_minutes unless a short trip day makes a reasonable adjustment necessary. Do not create other sightseeing visits.
 Document-reservation contract: when an uploaded document contains a confirmed flight, rail, or other transport reservation relevant to this trip, include it as a dedicated kind="transport" itinerary item on the applicable day. Prefer the confirmed transport reservations listed above when present; otherwise use the confirmed service details, route, and times from the raw document. Include an airline or operator and service number in the title when supplied. Do not invent a missing service number, terminal, booking reference, or time. Keep a separate ground-transfer row for any onward travel after arrival.
 Overnight-travel day-numbering contract: day_number represents a day of the trip experience, not a strict calendar date. When a confirmed departure and its arrival cross midnight (an overnight flight or similar), keep the departure and every arrival-day activity — the ground transfer, hotel check-in, and that day's sightseeing — under the same day_number as the departure; never start a new day_number just because the clock crossed midnight overnight. Only start a new day_number for the next real day of the trip once it begins.
-Day-length contract: on a full sightseeing day (not an arrival or departure day constrained by flight times), plan realistically from about 09:00 to 18:00, then include a kind="meal" dinner activity with start_time between 19:30 and 21:00. There is no fixed activity-count target — fit as many places as genuinely fit at a comfortable, non-rushed pace using authentic visit and travel durations; do not pad the day with filler activities just to occupy time, and do not end a full day earlier than 18:00 unless there are no more relevant places left to schedule.
+Intercity-transport contract: on the first day a destination appears in the day-to-destination mapping above (other than the very first day of the trip), include an intercity kind="transport" item as that day's first activity for the journey from the previous destination. Its title must name the origin city, destination city, and a realistic mode (train, flight, or drive); duration_minutes must be a realistic estimate for that route. Do not invent a specific operator, flight/train number, booking reference, or exact price for this leg unless a confirmed reservation for it was supplied above — use a rounded, clearly-approximate estimated_cost instead.
+Free-day contract: a day mapped to "no destination (free day)" in the day-to-destination mapping above is a flexible day. Do not apply the day-length contract's forced 09:00 to 18:00 sightseeing block to it. You may suggest at most 2 light, optional activities, but every one of them and the day's own notes must clearly identify it as part of a free/flex day; do not pad it to look like a full sightseeing day.
+Day-length contract: on a full sightseeing day (not an arrival or departure day constrained by flight times, and not a free day), plan realistically from about 09:00 to 18:00, then include a kind="meal" dinner activity with start_time between 19:30 and 21:00. There is no fixed activity-count target — fit as many places as genuinely fit at a comfortable, non-rushed pace using authentic visit and travel durations; do not pad the day with filler activities just to occupy time, and do not end a full day earlier than 18:00 unless there are no more relevant places left to schedule.
 Route-row contract: make every meaningful route a separate kind="transport" activity—not a note attached to another activity—between activities in distinct areas, including arrival transfers. For every transport activity, title must name origin, destination, and best practical mode; duration_minutes must match travel time; and estimated_cost must be the approximate per-group fare in the destination's local currency. Use 0 only for a genuinely free route such as walking.
 Transport recommendation contract: whenever a recommendation involves reserving or buying transport, include the direct official operator or official booking URL in the recommendation text. Do not invent URLs; omit a URL when no official reservation is applicable.
 Return only a JSON object with exactly these keys: "itinerary" and "recommendations". "itinerary" must be an array of at least 4 items; keep it detailed but focused. Each item must contain: day_number (positive integer), kind (one of visit, transport, meal, stay), title (short string), start_time (HH:MM), end_time (HH:MM), duration_minutes (positive integer), estimated_cost (non-negative number), and notes (short string). Include a transport item whenever the traveler needs to move between distinct areas, including arrival transfers. For every transport item, title must clearly name the origin, destination, and best practical mode (for example, "South Bank → Covent Garden: walk"); notes must give concise route guidance, a realistic approximate duration, and an alternative only when useful. "recommendations" must be an object with "food", "transport", "passes", and "weather" arrays. Provide 2–4 concise, practical recommendations in each array for this specific destination and trip. In "passes", recommend the most popular, named local transport or sightseeing passes when they genuinely exist, and say in one sentence which traveler or itinerary pattern each suits. Do not return generic advice alone; if no suitable named pass exists, explicitly say so. In "weather", describe typical seasonal conditions for the destination and trip dates plus useful packing or planning advice; never claim this is a live or guaranteed forecast. Use no markdown. Do not invent bookings, exact operating hours, eligibility, or guaranteed prices."""
@@ -633,12 +671,12 @@ def format_top_place(place: TopPlace) -> str:
     return f"{place.name} - {place.reason} (Suggested visit: {place.recommended_duration_minutes} min)"
 
 
-def has_exactly_twenty_distinct_top_places(top_places: list[TopPlace]) -> bool:
+def has_expected_distinct_top_places(top_places: list[TopPlace], expected_count: int) -> bool:
     normalized_names = {
         re.sub(r"[^a-z0-9]+", " ", place.name.lower()).strip()
         for place in top_places
     }
-    return len(top_places) == 20 and len(normalized_names) == 20
+    return len(top_places) == expected_count and len(normalized_names) == expected_count
 
 
 def _reconcile_itinerary_prompt(
@@ -838,7 +876,10 @@ def destination_date_issue(destinations: list[Destination]) -> str | None:
 def destination_for_day(data: TripWrite, day_number: int) -> Destination | None:
     """Return which destination day_number falls under, or None for a free/gap day.
     A day shared by two destinations' ranges (a same-day transition) resolves to
-    the destination that starts on that day."""
+    the destination that starts on that day. A lone destination with no dates of
+    its own yet (e.g. a trip created via the chat flow, which does not set
+    per-destination dates) is treated as spanning the whole trip, the same
+    fallback the frontend applies when backfilling an old trip's dates."""
     if not data.start_date:
         return None
     try:
@@ -846,10 +887,10 @@ def destination_for_day(data: TripWrite, day_number: int) -> Destination | None:
     except ValueError:
         return None
     day_iso = day_date.isoformat()
-    candidates = [
-        d for d in data.destinations
-        if d.start_date and d.end_date and d.start_date <= day_iso <= d.end_date
-    ]
+    dated = [d for d in data.destinations if d.start_date and d.end_date]
+    if not dated and len(data.destinations) == 1:
+        return data.destinations[0]
+    candidates = [d for d in dated if d.start_date <= day_iso <= d.end_date]
     if not candidates:
         return None
     for destination in candidates:
@@ -873,22 +914,31 @@ def generate_validated_itinerary(
     if destination_issue:
         raise HTTPException(422, destination_issue)
     try:
-        top_places_payload = parse_agent_json(
-            generate_itinerary(_top_places_prompt(data, document_context), document_workspace, document_files)
-        )
-        top_places = [TopPlace.model_validate(place) for place in top_places_payload["places"]]
-        if not has_exactly_twenty_distinct_top_places(top_places):
-            raise ValueError("The places agent must return 20 distinct places")
+        top_places_by_destination: dict[str, list[TopPlace]] = {}
+        for destination in data.destinations:
+            place_count = top_place_count_for_destination(destination, data.destinations)
+            top_places_payload = parse_agent_json(
+                generate_itinerary(
+                    _top_places_prompt(data, destination, place_count, document_context),
+                    document_workspace,
+                    document_files,
+                )
+            )
+            places = [TopPlace.model_validate(place) for place in top_places_payload["places"]]
+            if not has_expected_distinct_top_places(places, place_count):
+                raise ValueError(f"The places agent must return {place_count} distinct places for {destination.city}")
+            top_places_by_destination[f"{destination.city}, {destination.country}"] = places
+        all_top_places = [place for places in top_places_by_destination.values() for place in places]
         payload = parse_agent_json(
             generate_itinerary(
-                _itinerary_prompt(data, top_places, document_context, confirmed_segments),
+                _itinerary_prompt(data, top_places_by_destination, document_context, confirmed_segments),
                 document_workspace,
                 document_files,
             )
         )
         itinerary = [ItineraryItem.model_validate(item) for item in payload["itinerary"]]
         recommendations = PlanRecommendations.model_validate(payload["recommendations"])
-        recommendations.places = [format_top_place(place) for place in top_places]
+        recommendations.places = [format_top_place(place) for place in all_top_places]
     except EnvironmentError as exc:
         raise HTTPException(503, str(exc)) from exc
     except (json.JSONDecodeError, KeyError, ValueError) as exc:
@@ -897,7 +947,7 @@ def generate_validated_itinerary(
         raise HTTPException(502, f"Itinerary generation failed: {exc}") from exc
     if not has_minimum_generated_activities(itinerary):
         raise HTTPException(502, "The itinerary model returned an invalid number of activities. Please try again.")
-    if any(item.kind == "visit" and not is_top_place_visit(item.title, top_places) for item in itinerary):
+    if any(item.kind == "visit" and not is_top_place_visit(item.title, all_top_places) for item in itinerary):
         raise HTTPException(502, "The itinerary model used a place outside the selected Top 20. Please try again.")
     itinerary, errors = orchestrate_itinerary(data, itinerary, confirmed_segments)
     return {"itinerary": [item.model_dump() for item in itinerary], "recommendations": recommendations.model_dump(), "errors": errors}
@@ -1288,12 +1338,13 @@ def claude_usage(user: dict = Depends(current_user)):
 
 @app.get("/settings/prompts")
 def settings_prompts(user: dict = Depends(current_user)):
-    sample = TripWrite(name="<trip name>", start_date="YYYY-MM-DD", end_date="YYYY-MM-DD", destinations=[Destination(country="<country>", city="<city>")])
+    sample_destination = Destination(country="<country>", city="<city>", start_date="YYYY-MM-DD", end_date="YYYY-MM-DD")
+    sample = TripWrite(name="<trip name>", start_date="YYYY-MM-DD", end_date="YYYY-MM-DD", destinations=[sample_destination])
     place = TopPlace(name="<place>", reason="<reason>", recommended_duration_minutes=90)
     return {"prompts": [
         {"name": "Document extraction", "text": _document_extraction_prompt("<filename>", "<document text>")},
-        {"name": "Top places", "text": _top_places_prompt(sample, "<document context>")},
-        {"name": "Itinerary planning", "text": _itinerary_prompt(sample, [place], "<document context>", "<confirmed segments>")},
+        {"name": "Top places", "text": _top_places_prompt(sample, sample_destination, 20, "<document context>")},
+        {"name": "Itinerary planning", "text": _itinerary_prompt(sample, {"<city>, <country>": [place]}, "<document context>", "<confirmed segments>")},
         {"name": "Itinerary reconciliation", "text": _reconcile_itinerary_prompt(sample, [], "<confirmed segments>")},
         {"name": "Itinerary validation", "text": _validation_prompt(sample, [], "<confirmed segments>")},
         {"name": "Trip draft extraction", "text": _trip_draft_prompt("<traveler message>")},
