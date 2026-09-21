@@ -600,6 +600,7 @@ Top places selected in the first planning pass: {supplied_places}
 {confirmed_segments_section(confirmed_segments)}
 Every kind="visit" itinerary item must use one supplied place name, exactly as provided. Use as many supplied places as realistically fit within the trip dates and daily time limits; do not force all 20 into the itinerary. Use its recommended_duration_minutes unless a short trip day makes a reasonable adjustment necessary. Do not create other sightseeing visits.
 Document-reservation contract: when an uploaded document contains a confirmed flight, rail, or other transport reservation relevant to this trip, include it as a dedicated kind="transport" itinerary item on the applicable day. Prefer the confirmed transport reservations listed above when present; otherwise use the confirmed service details, route, and times from the raw document. Include an airline or operator and service number in the title when supplied. Do not invent a missing service number, terminal, booking reference, or time. Keep a separate ground-transfer row for any onward travel after arrival.
+Overnight-travel day-numbering contract: day_number represents a day of the trip experience, not a strict calendar date. When a confirmed departure and its arrival cross midnight (an overnight flight or similar), keep the departure and every arrival-day activity — the ground transfer, hotel check-in, and that day's sightseeing — under the same day_number as the departure; never start a new day_number just because the clock crossed midnight overnight. Only start a new day_number for the next real day of the trip once it begins.
 Day-length contract: on a full sightseeing day (not an arrival or departure day constrained by flight times), plan realistically from about 09:00 to 18:00, then include a kind="meal" dinner activity with start_time between 19:30 and 21:00. There is no fixed activity-count target — fit as many places as genuinely fit at a comfortable, non-rushed pace using authentic visit and travel durations; do not pad the day with filler activities just to occupy time, and do not end a full day earlier than 18:00 unless there are no more relevant places left to schedule.
 Route-row contract: make every meaningful route a separate kind="transport" activity—not a note attached to another activity—between activities in distinct areas, including arrival transfers. For every transport activity, title must name origin, destination, and best practical mode; duration_minutes must match travel time; and estimated_cost must be the approximate per-group fare in the destination's local currency. Use 0 only for a genuinely free route such as walking.
 Transport recommendation contract: whenever a recommendation involves reserving or buying transport, include the direct official operator or official booking URL in the recommendation text. Do not invent URLs; omit a URL when no official reservation is applicable.
@@ -1232,6 +1233,19 @@ def claude_usage(user: dict = Depends(current_user)):
         )
         usage = cur.fetchone()
     return {"provider": "anthropic", **usage}
+
+@app.get("/settings/prompts")
+def settings_prompts(user: dict = Depends(current_user)):
+    sample = TripWrite(name="<trip name>", start_date="YYYY-MM-DD", end_date="YYYY-MM-DD", destinations=[Destination(country="<country>", city="<city>")])
+    place = TopPlace(name="<place>", reason="<reason>", recommended_duration_minutes=90)
+    return {"prompts": [
+        {"name": "Document extraction", "text": _document_extraction_prompt("<filename>", "<document text>")},
+        {"name": "Top places", "text": _top_places_prompt(sample, "<document context>")},
+        {"name": "Itinerary planning", "text": _itinerary_prompt(sample, [place], "<document context>", "<confirmed segments>")},
+        {"name": "Itinerary reconciliation", "text": _reconcile_itinerary_prompt(sample, [], "<confirmed segments>")},
+        {"name": "Itinerary validation", "text": _validation_prompt(sample, [], "<confirmed segments>")},
+        {"name": "Trip draft extraction", "text": _trip_draft_prompt("<traveler message>")},
+    ]}
 
 @app.post("/trips/{trip_id}/conversations/{conversation_id}/messages")
 def chat(trip_id:str,conversation_id:str,data:ChatRequest,user:dict=Depends(current_user)):

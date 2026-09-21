@@ -494,6 +494,10 @@ header {
   padding: clamp(1.5rem, 4vw, 3rem) 0;
 }
 .settings-page h1 { margin: 0; font-size: clamp(2rem, 4vw, 3.2rem); }
+.prompt-library { margin-top: 2rem; }
+.prompt-library details { margin: .6rem 0; border: 1px solid #e5e0d5; border-radius: .5rem; padding: .75rem 1rem; background: #fffdf9; }
+.prompt-library summary { cursor: pointer; font-weight: 800; color: #8d4d27; }
+.prompt-library pre { white-space: pre-wrap; overflow-wrap: anywhere; font: .78rem/1.45 ui-monospace, monospace; color: #3d4b58; }
 .settings-intro { color: #5f6979; line-height: 1.55; }
 .usage-grid {
   display: grid;
@@ -920,7 +924,7 @@ h2 {
 .assistant {
   display: flex;
   flex-direction: column;
-  min-height: 42rem;
+  min-height: 26rem;
   background: #fcfaf5;
   transition:
     transform 220ms ease,
@@ -931,6 +935,12 @@ h2 {
   align-items: flex-start;
   justify-content: space-between;
   gap: 0.5rem;
+}
+.assistant-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 .chat-controls {
   display: flex;
@@ -999,11 +1009,12 @@ h2 {
   line-height: 1.45;
   font-size: 0.92rem;
 }
-.message.user {
+.message.msg-user {
   align-self: flex-end;
   background: #e6f0e7;
 }
-.message.assistant {
+.message.msg-assistant {
+  align-self: flex-start;
   background: #f1e7da;
 }
 .chat {

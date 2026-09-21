@@ -71,6 +71,7 @@ type Message = {
   output_tokens?: number | null;
 };
 type ClaudeUsage = { provider: "anthropic"; input_tokens: number; output_tokens: number; message_count: number };
+type PromptTemplate = { name: string; text: string };
 type TripDraft = {
   name: string | null;
   start_date: string | null;
@@ -79,6 +80,11 @@ type TripDraft = {
   children: number | null;
   trip_type: string | null;
   destinations: Destination[];
+};
+const farFutureCutoff = (): string => {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() + 3);
+  return d.toISOString().slice(0, 10);
 };
 const sameDestinations = (a: Destination[], b: Destination[]): boolean =>
   a.length === b.length &&
@@ -208,6 +214,7 @@ function App() {
     [draggedItem, setDraggedItem] = useState<number | null>(null),
     [dropTarget, setDropTarget] = useState<number | null>(null),
     [claudeUsage, setClaudeUsage] = useState<ClaudeUsage | null>(null),
+    [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([]),
     [view, setView] = useState<"planner" | "trips" | "essentials" | "settings">(() =>
       window.location.pathname === "/trips" ? "trips" : window.location.pathname === "/essentials" ? "essentials" : window.location.pathname === "/settings" ? "settings" : "planner",
     );
@@ -353,7 +360,12 @@ function App() {
     setView("settings");
     window.history.pushState({}, "", "/settings");
     try {
-      setClaudeUsage(await api<ClaudeUsage>("/settings/usage"));
+      const [usage, promptData] = await Promise.all([
+        api<ClaudeUsage>("/settings/usage"),
+        api<{ prompts: PromptTemplate[] }>("/settings/prompts"),
+      ]);
+      setClaudeUsage(usage);
+      setPromptTemplates(promptData.prompts);
       setError("");
     } catch (x) {
       setError((x as Error).message);
@@ -436,12 +448,15 @@ function App() {
     const defaults = blank();
     const labels: string[] = [];
     if (!t.name.trim()) labels.push("trip name");
-    const datesLookUnset =
-      !t.start_date ||
-      !t.end_date ||
-      t.start_date > t.end_date ||
-      (t.start_date === defaults.start_date && t.end_date === defaults.end_date);
-    if (datesLookUnset && !confirmed.dates) labels.push("dates");
+    // A genuinely broken range (missing, or start after end) is always wrong and
+    // must never be suppressed by "confirmed" — that flag only excuses a value
+    // that merely *looks* like the untouched default, not one that's invalid.
+    const datesLookDefault = t.start_date === defaults.start_date && t.end_date === defaults.end_date;
+    if (!t.start_date || !t.end_date) labels.push("dates");
+    else if (t.start_date > t.end_date) labels.push("dates (start date is after the end date)");
+    else if (t.start_date > farFutureCutoff() || t.end_date > farFutureCutoff())
+      labels.push("dates (that year looks like a typo — please confirm)");
+    else if (datesLookDefault && !confirmed.dates) labels.push("dates");
     if (
       !t.destinations.length ||
       t.destinations.some((d) => !d.country.trim() || !d.city.trim())
@@ -640,6 +655,18 @@ function App() {
       const isFreshTrip = !("id" in trip);
       const merged = { ...trip, destinations: trip.destinations };
       let changed = false;
+      // "Only fill if still blank" protects a value the user deliberately set from
+      // being clobbered by a later message — but it must not also protect a value
+      // that's already known to be wrong, or there's no way to correct a mistake
+      // in chat once the trip is saved. Snapshot this from the *original* trip
+      // (before any edits below), since fixing one date can change whether the
+      // pair still looks broken to a check made mid-merge.
+      const datesCurrentlyBroken =
+        !trip.start_date ||
+        !trip.end_date ||
+        trip.start_date > trip.end_date ||
+        trip.start_date > farFutureCutoff() ||
+        trip.end_date > farFutureCutoff();
       // Unlike the other fields, name can be invented by the model rather than
       // extracted verbatim, so its wording can vary between calls even for the
       // same trip. Only ever set it once, while it's still blank, so re-describing
@@ -648,11 +675,19 @@ function App() {
         merged.name = draft.name;
         changed = true;
       }
-      if (draft.start_date && draft.start_date !== merged.start_date && (isFreshTrip || !merged.start_date)) {
+      if (
+        draft.start_date &&
+        draft.start_date !== merged.start_date &&
+        (isFreshTrip || !merged.start_date || datesCurrentlyBroken)
+      ) {
         merged.start_date = draft.start_date;
         changed = true;
       }
-      if (draft.end_date && draft.end_date !== merged.end_date && (isFreshTrip || !merged.end_date)) {
+      if (
+        draft.end_date &&
+        draft.end_date !== merged.end_date &&
+        (isFreshTrip || !merged.end_date || datesCurrentlyBroken)
+      ) {
         merged.end_date = draft.end_date;
         changed = true;
       }
@@ -686,6 +721,14 @@ function App() {
             ? `Got it — I've updated the trip details from your message. Still needed: ${stillMissing.join(", ")}.`
             : `All set! I've filled in the trip details from your message — click "Generate a random plan" whenever you're ready.`,
       );
+      return;
+    }
+    // The trip is fully set up — if this message is asking to actually build the
+    // itinerary rather than a general question, do it directly instead of just
+    // telling the user to go click the button themselves.
+    if (/\b(generate|create|build|make|start)\b[\s\S]*\b(plan|itinerary)\b/i.test(content)) {
+      reply(`On it — generating your itinerary now. Watch the "Agent is working" status above while it builds.`);
+      await generateRandomPlan();
       return;
     }
     if (!("id" in trip)) {
@@ -1010,6 +1053,16 @@ function App() {
             <section><span>Claude responses</span><strong>{claudeUsage?.message_count.toLocaleString() ?? "—"}</strong></section>
           </div>
           <p className="empty">No estimated token counts are used; totals only include usage returned by the Claude SDK.</p>
+          <section className="prompt-library" aria-label="Program prompts">
+            <h2>Program prompts</h2>
+            <p className="settings-intro">Templates are shown with placeholders; no trip details or uploaded document contents are exposed.</p>
+            {promptTemplates.map((prompt) => (
+              <details key={prompt.name}>
+                <summary>{prompt.name}</summary>
+                <pre>{prompt.text}</pre>
+              </details>
+            ))}
+          </section>
         </section>
       </main>
     );
@@ -1640,7 +1693,7 @@ function App() {
                 </p>
               ) : (
                 messages.map((m) => (
-                  <div className={`message ${m.role}`} key={m.id}>
+                  <div className={`message msg-${m.role}`} key={m.id}>
                     {m.content}
                   </div>
                 ))
