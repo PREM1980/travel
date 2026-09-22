@@ -34,6 +34,7 @@ type DocumentUploadResponse = {
   trip: Trip;
   errors: string[];
   recalculation_error?: string;
+  recalibration_pending?: boolean;
   extraction_error?: string;
   date_conflict?: DateConflict;
 };
@@ -72,6 +73,9 @@ type Message = {
 };
 type ClaudeUsage = { provider: "anthropic"; input_tokens: number; output_tokens: number; message_count: number };
 type PromptTemplate = { name: string; text: string };
+type PromptTestResult = { content: string; provider: string; model: string; input_tokens: number | null; output_tokens: number | null };
+type PromptTestState = { text: string; running: boolean; result: PromptTestResult | null; error: string | null };
+type FormattedModelResponse = { content: string; isJson: boolean };
 type TripDraft = {
   name: string | null;
   start_date: string | null;
@@ -93,6 +97,17 @@ const sameDestinations = (a: Destination[], b: Destination[]): boolean =>
       d.country.trim().toLowerCase() === b[i].country.trim().toLowerCase() &&
       d.city.trim().toLowerCase() === b[i].city.trim().toLowerCase(),
   );
+const formatModelResponse = (content: string): FormattedModelResponse => {
+  const candidate = content
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  try {
+    return { content: JSON.stringify(JSON.parse(candidate), null, 2), isJson: true };
+  } catch {
+    return { content, isJson: false };
+  }
+};
 const dayNumberDate = (startDate: string, dayNumber: number): Date => {
   const [year, month, day] = startDate.split("-").map(Number);
   return new Date(year, month - 1, day + (dayNumber - 1));
@@ -276,6 +291,8 @@ function App() {
     [dropTarget, setDropTarget] = useState<number | null>(null),
     [claudeUsage, setClaudeUsage] = useState<ClaudeUsage | null>(null),
     [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([]),
+    [promptTests, setPromptTests] = useState<Record<string, PromptTestState>>({}),
+    [selectedPromptName, setSelectedPromptName] = useState<string | null>(null),
     [view, setView] = useState<"planner" | "trips" | "essentials" | "settings">(() =>
       window.location.pathname === "/trips" ? "trips" : window.location.pathname === "/essentials" ? "essentials" : window.location.pathname === "/settings" ? "settings" : "planner",
     );
@@ -422,6 +439,10 @@ function App() {
     setView("trips");
     window.history.pushState({}, "", "/trips");
   };
+  const goHome = () => {
+    setView("planner");
+    window.history.pushState({}, "", "/");
+  };
   const showEssentials = () => {
     setView("essentials");
     window.history.pushState({}, "", "/essentials");
@@ -436,9 +457,31 @@ function App() {
       ]);
       setClaudeUsage(usage);
       setPromptTemplates(promptData.prompts);
+      setSelectedPromptName((current) =>
+        promptData.prompts.some((prompt) => prompt.name === current)
+          ? current
+          : promptData.prompts[0]?.name ?? null,
+      );
       setError("");
     } catch (x) {
       setError((x as Error).message);
+    }
+  };
+  useEffect(() => {
+    if (window.location.pathname === "/settings") void showSettings();
+  }, []);
+  const setPromptTestText = (name: string, text: string) =>
+    setPromptTests((tests) => ({ ...tests, [name]: { text, running: false, result: null, error: tests[name]?.error ?? null } }));
+  const runPromptTest = async (name: string, text: string) => {
+    setPromptTests((tests) => ({ ...tests, [name]: { text, running: true, result: null, error: null } }));
+    try {
+      const result = await api<PromptTestResult>("/settings/prompts/test", {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+      setPromptTests((tests) => ({ ...tests, [name]: { text, running: false, result, error: null } }));
+    } catch (x) {
+      setPromptTests((tests) => ({ ...tests, [name]: { text, running: false, result: null, error: (x as Error).message } }));
     }
   };
   const deleteTrip = async (savedTrip: Pick<Trip, "id" | "name">) => {
@@ -597,7 +640,7 @@ function App() {
     ...emptyRecommendations(),
     ...trip.plans[trip.active_plan_index]?.recommendations,
   };
-  const generateRandomPlan = async () => {
+  const generateRandomPlan = async (replaceActivePlan = false) => {
     if (!canGenerateRandomPlan) {
       setShowValidation(true);
       setError(
@@ -611,18 +654,21 @@ function App() {
         method: "POST",
         body: JSON.stringify(trip),
       });
-      const plans = [
-        ...trip.plans,
-        {
-          name: `Plan ${trip.plans.length + 1}`,
-          itinerary: generated.itinerary,
-          recommendations: generated.recommendations ?? emptyRecommendations(),
-        },
-      ];
+      const recalibratedPlan = {
+        name: trip.plans[trip.active_plan_index]?.name ?? `Plan ${trip.plans.length + 1}`,
+        itinerary: generated.itinerary,
+        recommendations: generated.recommendations ?? emptyRecommendations(),
+      };
+      const plans = replaceActivePlan && trip.plans.length
+        ? trip.plans.map((plan, index) => index === trip.active_plan_index ? recalibratedPlan : plan)
+        : [...trip.plans, recalibratedPlan];
+      const activePlanIndex = replaceActivePlan && trip.plans.length
+        ? trip.active_plan_index
+        : plans.length - 1;
       const generatedTrip = {
         ...trip,
         plans,
-        active_plan_index: plans.length - 1,
+        active_plan_index: activePlanIndex,
         itinerary: generated.itinerary,
         plan_generated: true,
       };
@@ -893,7 +939,7 @@ function App() {
       setTrip(result.trip);
       setScheduleWarnings(result.errors);
       setDocumentError(
-        [result.extraction_error, result.recalculation_error].filter(Boolean).join(" "),
+        [result.extraction_error, result.recalculation_error, result.recalibration_pending ? "Document facts saved. Click Recalibrate trip to update the selected plan." : ""].filter(Boolean).join(" "),
       );
       setDateConflict(result.date_conflict || null);
       setUploadName("");
@@ -924,7 +970,7 @@ function App() {
       setTrip(result.trip);
       setScheduleWarnings(result.errors);
       setDateConflict(null);
-      setDocumentError(result.recalculation_error || "");
+      setDocumentError(result.recalibration_pending ? "Document removed. Click Recalibrate trip to update the selected plan." : result.recalculation_error || "");
       await loadTrips();
     } catch (x) {
       setDocumentError((x as Error).message);
@@ -1017,19 +1063,12 @@ function App() {
     return (
       <main className="app">
         <header>
-          <div>
+          <button className="app-logo" onClick={goHome} aria-label="Go to home">
             <p className="eyebrow">TRAVEL PLANNER</p>
             <strong>Welcome, {user.display_name}</strong>
-          </div>
+          </button>
           <div className="header-actions">
-            <button
-              onClick={() => {
-                setView("planner");
-                window.history.pushState({}, "", "/");
-              }}
-            >
-              Plan a trip
-            </button>
+            <button onClick={goHome}>Plan a trip</button>
             <button onClick={showEssentials}>Essentials</button>
             <button onClick={showSettings}>Settings</button>
             <button
@@ -1098,9 +1137,12 @@ function App() {
     return (
       <main className="app">
         <header>
-          <div><p className="eyebrow">TRAVEL PLANNER</p><strong>Welcome, {user.display_name}</strong></div>
+          <button className="app-logo" onClick={goHome} aria-label="Go to home">
+            <p className="eyebrow">TRAVEL PLANNER</p>
+            <strong>Welcome, {user.display_name}</strong>
+          </button>
           <div className="header-actions">
-            <button onClick={() => { setView("planner"); window.history.pushState({}, "", "/"); }}>Plan a trip</button>
+            <button onClick={goHome}>Plan a trip</button>
             <button onClick={showTrips}>My trips</button>
             <button onClick={showSettings}>Settings</button>
             <button onClick={async () => { await api("/auth/logout", { method: "POST" }); setUser(null); }}>Sign out</button>
@@ -1125,9 +1167,12 @@ function App() {
     return (
       <main className="app">
         <header>
-          <div><p className="eyebrow">TRAVEL PLANNER</p><strong>Welcome, {user.display_name}</strong></div>
+          <button className="app-logo" onClick={goHome} aria-label="Go to home">
+            <p className="eyebrow">TRAVEL PLANNER</p>
+            <strong>Welcome, {user.display_name}</strong>
+          </button>
           <div className="header-actions">
-            <button onClick={() => { setView("planner"); window.history.pushState({}, "", "/"); }}>Plan a trip</button>
+            <button onClick={goHome}>Plan a trip</button>
             <button onClick={showTrips}>My trips</button>
             <button onClick={showEssentials}>Essentials</button>
             <button onClick={async () => { await api("/auth/logout", { method: "POST" }); setUser(null); }}>Sign out</button>
@@ -1147,12 +1192,70 @@ function App() {
           <section className="prompt-library" aria-label="Program prompts">
             <h2>Program prompts</h2>
             <p className="settings-intro">Templates are shown with placeholders; no trip details or uploaded document contents are exposed.</p>
-            {promptTemplates.map((prompt) => (
-              <details key={prompt.name}>
-                <summary>{prompt.name}</summary>
-                <pre>{prompt.text}</pre>
-              </details>
-            ))}
+            <div className="prompt-workspace">
+              <nav className="prompt-nav" aria-label="Prompt templates">
+                <p>Templates</p>
+                {promptTemplates.map((prompt) => (
+                  <button
+                    key={prompt.name}
+                    type="button"
+                    className={selectedPromptName === prompt.name ? "active" : ""}
+                    aria-pressed={selectedPromptName === prompt.name}
+                    onClick={() => setSelectedPromptName(prompt.name)}
+                  >
+                    {prompt.name}
+                  </button>
+                ))}
+              </nav>
+              {(() => {
+                const prompt = promptTemplates.find((item) => item.name === selectedPromptName);
+                if (!prompt) return <p className="empty prompt-empty">Select a template to inspect or test it.</p>;
+                const test = promptTests[prompt.name];
+                const text = test?.text ?? prompt.text;
+                const response = test?.result ? formatModelResponse(test.result.content) : null;
+                return (
+                  <section className="prompt-editor" aria-labelledby="selected-prompt-heading">
+                    <h3 id="selected-prompt-heading">{prompt.name}</h3>
+                    <label className="prompt-test-label" htmlFor={`prompt-test-${prompt.name}`}>
+                      Edit the placeholders below, then run it against the configured model.
+                    </label>
+                    <textarea
+                      id={`prompt-test-${prompt.name}`}
+                      className="prompt-test-input"
+                      value={text}
+                      onChange={(e) => setPromptTestText(prompt.name, e.target.value)}
+                      rows={18}
+                    />
+                    <div className="prompt-test-actions">
+                      <button type="button" disabled={test?.running || !text.trim()} onClick={() => runPromptTest(prompt.name, text)}>
+                        {test?.running ? "Running…" : "Run"}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={test?.running}
+                        onClick={() => setPromptTests((tests) => ({ ...tests, [prompt.name]: { text: prompt.text, running: false, result: null, error: null } }))}
+                      >
+                        Reset to template
+                      </button>
+                    </div>
+                    {test?.error && <p className="error banner">{test.error}</p>}
+                    {test?.result && (
+                      <div className="prompt-test-result">
+                        <p className="settings-intro">
+                          {test.result.provider} · {test.result.model}
+                          {test.result.input_tokens != null && test.result.output_tokens != null
+                            ? ` · ${test.result.input_tokens.toLocaleString()} in / ${test.result.output_tokens.toLocaleString()} out`
+                            : ""}
+                        </p>
+                        <p className="prompt-result-format">{response?.isJson ? "Structured JSON response" : "Raw model response"}</p>
+                        <pre>{response?.content}</pre>
+                      </div>
+                    )}
+                  </section>
+                );
+              })()}
+            </div>
           </section>
         </section>
       </main>
@@ -1204,10 +1307,18 @@ function App() {
               <h1>Make the most of every day.</h1>
             </div>
             <div className="plan-actions">
+              <button
+                className="secondary recalibrate"
+                onClick={() => generateRandomPlan(true)}
+                disabled={!canGenerateRandomPlan || isGenerating}
+                title="Replace the selected plan with one generated from the current trip details"
+              >
+                {isGenerating ? "Recalibrating…" : "Recalibrate trip"}
+              </button>
               {trip.plans.length < 5 && (
                 <button
                   className="random"
-                  onClick={generateRandomPlan}
+                  onClick={() => generateRandomPlan()}
                   disabled={!canGenerateRandomPlan || isGenerating}
                 >
                   ✦{" "}
